@@ -1,0 +1,267 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>CTA Live Trains — Smooth + Route Filters</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+<style>
+  #map{height:100vh;}
+  .train-dot{width:14px;height:14px;border-radius:50%;border:2px solid #000;}
+  .leaflet-control.routes {
+    background: #fff; padding: 8px 10px; border-radius: 6px;
+    box-shadow: 0 2px 8px rgba(0,0,0,.15); font: 14px/1.2 system-ui, sans-serif;
+  }
+  .routes h4 { margin: 0 0 6px; font-size: 14px; }
+  .routes label { display:flex; align-items:center; gap:6px; margin:4px 0; cursor:pointer; }
+  .swatch { width:12px; height:12px; border-radius:999px; border:1px solid #000; display:inline-block; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<script>
+// --- configuration ---
+const POLL_MS = 30_000;          // poll interval (ms)
+const CORRECT_MS = 1200;         // correction ease duration after each poll
+const MAX_DRIFT_METERS = 500;    // if predicted too far from truth, snap instead
+const FALLBACK_SPEED = 10;       // m/s (~22 mph) if position unchanged
+const MIN_SPEED = 0.5;           // below this, treat as stopped
+
+// Route colors + canonical route keys (must match your DB tables: red, blue, brn, g, org, p, pink, y)
+const ROUTES = [
+  ["red",  "#c60c30", "Red"],
+  ["blue", "#00a1de", "Blue"],
+  ["brn",  "#62361b", "Brown"],
+  ["g",    "#009b3a", "Green"],
+  ["org",  "#f9461c", "Orange"],
+  ["p",    "#522398", "Purple"],
+  ["pink", "#e27ea6", "Pink"],
+  ["y",    "#f9e300", "Yellow"],
+];
+const colorByRoute = Object.fromEntries(ROUTES.map(([k,c]) => [k, c]));
+
+// --- map setup ---
+const map = L.map('map').setView([41.878, -87.629], 11);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+  {attribution:'© OpenStreetMap'}).addTo(map);
+
+// One LayerGroup per route so we can toggle visibility efficiently
+const groups = new Map(ROUTES.map(([k]) => [k, L.layerGroup().addTo(map)]));
+
+// Track which routes are visible (all on by default)
+const visible = new Map(ROUTES.map(([k]) => [k, true]));
+
+// --- helpers ---
+function haversineMeters(a,b){
+  const R=6371000, toRad=x=>x*Math.PI/180;
+  const dLat=toRad(b.lat-a.lat), dLon=toRad(b.lon-a.lon);
+  const la1=toRad(a.lat), la2=toRad(b.lat);
+  const s=Math.sin(dLat/2)**2 + Math.cos(la1)*Math.cos(la2)*Math.sin(dLon/2)**2;
+  return 2*R*Math.asin(Math.sqrt(s));
+}
+function lerp(a,b,t){ return a + (b-a)*t; }
+
+function advancePos(pos, vel, dtSec){
+  const mPerDegLat = 111_320;
+  const mPerDegLon = 111_320 * Math.cos(pos.lat * Math.PI/180);
+  return {
+    lat: pos.lat + (vel.vy / mPerDegLat) * dtSec,
+    lon: pos.lon + (vel.vx / mPerDegLon) * dtSec
+  };
+}
+
+// --- train state ---
+/*
+trains[id] = {
+  route, rn, color,
+  marker,                         // Leaflet marker (lives inside groups.get(route))
+  lastTruth, prevTruth,           // {lat, lon, tsPoll}
+  vel:{vx,vy}, speed, heading,
+  animBase:{lat,lon,t0},          // animation origin + start time
+  correctFrom, correctTo, correctStart, correcting
+}
+*/
+const trains = new Map(); // key: `${route}_${rn}`
+
+// --- rendering ---
+function makeIcon(color){
+  return L.divIcon({className:'', html:`<div class="train-dot" style="background:${color}"></div>`});
+}
+function popupHtml(r,speed){
+  const kph = speed != null ? (speed*3.6).toFixed(0) : "-";
+  return `<b>${r.route.toUpperCase()} Line</b><br>
+  Train ${r.rn}<br>
+  Next: ${r.next_station ?? '-'}<br>
+  Heading: ${r.heading ?? '-'}°<br>
+  Speed: ${kph} km/h<br>
+  Arriving: ${r.arriving_now ? 'Yes':'No'}<br>
+  Delayed: ${r.delayed ? 'Yes':'No'}<br>
+  Time: ${r.ts_utc}`;
+}
+
+// --- route filter control (checkboxes) ---
+const RoutesControl = L.Control.extend({
+  onAdd: function(){
+    const div = L.DomUtil.create('div', 'leaflet-control routes');
+    div.innerHTML = `
+      <h4>Routes</h4>
+      ${ROUTES.map(([k,c,label]) => `
+        <label>
+          <input type="checkbox" data-route="${k}" checked />
+          <span class="swatch" style="background:${c}"></span> ${label}
+        </label>
+      `).join('')}
+    `;
+    // Prevent map drag when interacting with control
+    L.DomEvent.disableClickPropagation(div);
+
+    // Wire up events
+    div.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+      cb.addEventListener('change', (e) => {
+        const r = e.target.getAttribute('data-route');
+        const show = e.target.checked;
+        visible.set(r, show);
+        const grp = groups.get(r);
+        if (show) {
+          grp.addTo(map);            // show group
+        } else {
+          grp.removeFrom(map);       // hide group
+        }
+      });
+    });
+    return div;
+  },
+  onRemove: function(){}
+});
+map.addControl(new RoutesControl({position:'topright'}));
+
+// --- polling ---
+async function poll(){
+  const res = await fetch('/latest', {cache:'no-store'});
+  const data = await res.json();
+  const seen = new Set();
+  const now = performance.now();
+  const tsPoll = Date.now();
+
+  for (const r of data){
+    if (r.lat == null || r.lon == null || !r.rn) continue;
+    const id = `${r.route}_${r.rn}`;
+    seen.add(id);
+    const route = r.route; // already lower-case from server
+    const color = colorByRoute[route] || '#000';
+    const truth = {lat:+r.lat, lon:+r.lon, tsPoll};
+    const heading = r.heading != null ? +r.heading : null;
+
+    // Ensure a group exists for this route (it will; created above)
+    const group = groups.get(route);
+
+    if (!trains.has(id)){
+      // New train marker lives inside its route group
+      const marker = L.marker([truth.lat, truth.lon], {
+        icon: makeIcon(color)
+      }).bindPopup(popupHtml(r,0));
+
+      marker.addTo(group); // add to route layer group (visible toggle controls display)
+
+      trains.set(id,{
+        route, rn:r.rn, color, marker,
+        lastTruth:truth, prevTruth:null,
+        vel:{vx:0,vy:0}, speed:0, heading,
+        animBase:{lat:truth.lat, lon:truth.lon, t0:now},
+        correctFrom:null, correctTo:null, correctStart:0, correcting:false
+      });
+      continue;
+    }
+
+    // Existing train: update
+    const t = trains.get(id);
+    t.heading = heading;
+    t.prevTruth = t.lastTruth;
+    t.lastTruth = truth;
+
+    // Estimate velocity from last two truths
+    let vx=0, vy=0, speed=0;
+    if (t.prevTruth){
+      const dt = Math.max(0.001,(t.lastTruth.tsPoll - t.prevTruth.tsPoll)/1000);
+      const mPerDegLat = 111_320;
+      const mPerDegLon = 111_320 * Math.cos(truth.lat*Math.PI/180);
+      vx = ((truth.lon - t.prevTruth.lon) * mPerDegLon) / dt;
+      vy = ((truth.lat - t.prevTruth.lat) * mPerDegLat) / dt;
+      speed = Math.hypot(vx,vy);
+    }
+    // Fallback to heading if basically stationary
+    if (speed < MIN_SPEED && t.heading != null){
+      const rad = t.heading * Math.PI/180;
+      vx = Math.sin(rad) * FALLBACK_SPEED; // east
+      vy = Math.cos(rad) * FALLBACK_SPEED; // north
+      speed = FALLBACK_SPEED;
+    }
+    // Cap unrealistic spikes
+    const maxS = 35; // m/s (~126 km/h)
+    if (speed > maxS){
+      const sc = maxS / speed; vx*=sc; vy*=sc; speed = maxS;
+    }
+    t.vel = {vx,vy}; t.speed = speed;
+
+    // Ease toward truth
+    const cur = getAnimatedPosition(t, now);
+    const err = haversineMeters(cur, truth);
+    if (err > MAX_DRIFT_METERS){
+      t.animBase = {lat:truth.lat, lon:truth.lon, t0:now};
+      t.correcting = false;
+      t.marker.setLatLng([truth.lat, truth.lon]);
+    } else {
+      t.correctFrom = cur;
+      t.correctTo   = truth;
+      t.correctStart= now;
+      t.correcting = true;
+      t.animBase = {lat:cur.lat, lon:cur.lon, t0:now};
+    }
+    t.marker.setPopupContent(popupHtml(r, t.speed));
+
+    // If user hid this route after the marker existed, make sure it lives in the right group
+    // (Adding to group again is idempotent; Leaflet handles it)
+    if (!visible.get(route)) {
+      groups.get(route).removeFrom(map);
+    }
+  }
+
+  // Remove trains that disappeared
+  for (const [id, t] of Array.from(trains.entries())){
+    if (!seen.has(id)){
+      groups.get(t.route).removeLayer(t.marker);
+      trains.delete(id);
+    }
+  }
+}
+
+function getAnimatedPosition(t, now){
+  const dtSec = (now - t.animBase.t0)/1000;
+  let pos = advancePos({lat:t.animBase.lat, lon:t.animBase.lon}, t.vel, dtSec);
+  if (t.correcting){
+    const u = Math.min(1,(now - t.correctStart)/CORRECT_MS);
+    pos = { lat: lerp(t.correctFrom.lat, t.correctTo.lat, u),
+            lon: lerp(t.correctFrom.lon, t.correctTo.lon, u) };
+    if (u >= 1) t.correcting = false;
+  }
+  return pos;
+}
+
+// --- animation loop ---
+function tick(){
+  const now = performance.now();
+  for (const [, t] of trains){
+    const pos = getAnimatedPosition(t, now);
+    t.marker.setLatLng([pos.lat, pos.lon]);
+  }
+  requestAnimationFrame(tick);
+}
+
+// Start
+poll();
+setInterval(poll, POLL_MS);
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
