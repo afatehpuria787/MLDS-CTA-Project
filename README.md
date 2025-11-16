@@ -16,6 +16,7 @@ This project continuously polls the CTA API, stores train positions in a SQLite 
 # Project Structure
 ```
 MLDS-CTA-Project/
+├── assets/ # Gifs used in the README are stored here
 │
 ├── src/
 │   ├── extract_data.py        # Polls CTA API & stores positions into SQLite
@@ -32,6 +33,15 @@ MLDS-CTA-Project/
 
 # Requirements
 
+### Git
+```
+Windows: https://git-scm.com/download/win
+
+macOS: https://git-scm.com/download/mac
+
+Linux: https://git-scm.com/download/linux
+```
+
 ### Docker Desktop
 ```
 Windows: https://docs.docker.com/desktop/install/windows-install/
@@ -45,18 +55,29 @@ Get one here:
 ```
 https://www.transitchicago.com/developers/traintracker/
 ```
+# Clone the Repo
+![Clone Demo](assets/clone.gif)
+Run this where you want this project to be stored on your local machine:
+```
+git clone https://github.com/Ben-Maisel/MLDS-CTA-Project.git
+```
 
 # Build the Docker image
+![Build Demo](assets/build.gif)
+**Make Sure Docker is Running on Your Machine**
 Run this in the project root folder (same directory as your Dockerfile):
 ```
 docker build -t cta-tracker .
 ```
+you must be in the right directory for this to work. If you are confused where you should be running this command, refer to the GIF
 
 # Run the container
-Run this command right after buiding the image:
+![Run Demo](assets/run.gif)
+Run this command right after buiding the image in the same location:
 ```
 docker run -e CTA_TRAIN_API_KEY="YOUR_API_KEY" -e CTA_DB_PATH="/app/cta_trains.db" -p 8000:8000 cta-tracker
 ```
+Use your API KEY
 
 This starts:
 
@@ -70,6 +91,7 @@ Starting FastAPI server on 0.0.0.0:8000…
 ```
 
 # View the live CTA map
+![View Demo](assets/browser.gif)
 In your browser, go to:
 ```
 http://localhost:8000
@@ -87,7 +109,7 @@ Smooth motion between updates
 Popups showing speed, heading, next station, delayed status, etc.
 
 # Stopping the container
-
+![Stop Demo](assets/stopping.gif)
 Press CTRL+C in the terminal.
 
 Or stop all containers:
