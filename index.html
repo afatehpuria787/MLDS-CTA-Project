@@ -1,0 +1,368 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>CTA Live Trains — On-Track + Route Filters</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+  <style>
+    #map{height:100vh;}
+    .train-dot{width:14px;height:14px;border-radius:50%;border:2px solid #000;}
+    .leaflet-control.routes {
+      background: #fff; padding: 8px 10px; border-radius: 6px;
+      box-shadow: 0 2px 8px rgba(0,0,0,.15); font: 14px/1.2 system-ui, sans-serif;
+    }
+    .routes h4 { margin: 0 0 6px; font-size: 14px; }
+    .routes label { display:flex; align-items:center; gap:6px; margin:4px 0; cursor:pointer; }
+    .swatch { width:12px; height:12px; border-radius:999px; border:1px solid #000; display:inline-block; }
+  </style>
+</head>
+<body>
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
+<script>
+// --- configuration ---
+const POLL_MS = 30_000;          // poll interval (ms)
+const CORRECT_MS = 1200;         // correction ease duration after each poll
+const MAX_DRIFT_METERS = 500;    // if predicted too far from truth, snap instead
+
+// Route colors + canonical route keys (must match your DB tables: red, blue, brn, g, org, p, pink, y)
+const ROUTES = [
+  ["red",  "#c60c30", "Red"],
+  ["blue", "#00a1de", "Blue"],
+  ["brn",  "#62361b", "Brown"],
+  ["g",    "#009b3a", "Green"],
+  ["org",  "#f9461c", "Orange"],
+  ["p",    "#522398", "Purple"],
+  ["pink", "#e27ea6", "Pink"],
+  ["y",    "#f9e300", "Yellow"],
+];
+const colorByRoute = Object.fromEntries(ROUTES.map(([k,c]) => [k, c]));
+
+// --- map setup ---
+const map = L.map('map').setView([41.878, -87.629], 11);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+  {attribution:'© OpenStreetMap'}).addTo(map);
+
+// One LayerGroup per route so we can toggle visibility efficiently
+const groups = new Map(ROUTES.map(([k]) => [k, L.layerGroup().addTo(map)]));
+// Optional: overlay group for track lines
+const trackGroup = L.layerGroup().addTo(map);
+
+// Track which routes are visible (all on by default)
+const visible = new Map(ROUTES.map(([k]) => [k, true]));
+
+// --- route polylines (from cta_routes.json) ---
+let routeLines = {};   // { red: turf.lineString, ... }
+let routeLengths = {}; // { red: length_km, ... }
+let routesReady = false;
+
+// Convert distance along route (km) -> {lat, lon}
+function routeToLatLon(route, sKm){
+  const line = routeLines[route];
+  if (!line) return null;
+  const total = routeLengths[route] ?? 0;
+  const sClamped = Math.max(0, Math.min(sKm, total));
+  const pt = turf.along(line, sClamped, { units: "kilometers" });
+  const [lon, lat] = pt.geometry.coordinates;
+  return { lat, lon };
+}
+
+// Snap a raw lat/lon to nearest point on the route line
+function snapToRoute(route, lat, lon){
+  const line = routeLines[route];
+  if (!line) return null;
+  const snapped = turf.nearestPointOnLine(line, turf.point([lon, lat]));
+  const sKm = snapped.properties.location; // same units as length()
+  const [lonSnap, latSnap] = snapped.geometry.coordinates;
+  return { sKm, lat: latSnap, lon: lonSnap };
+}
+
+// --- train state ---
+// trains[id] = {
+//   route, rn, color,
+//   marker,
+//   // along-route representation:
+//   lastTruthS,    // distance along route at last poll (km)
+//   prevTruthS,    // previous truth distance (km)
+//   velS,          // speed along route (km/s; signed)
+//   animBaseS,     // starting distance for current animation
+//   animStart,     // ms
+//   correctFromS,  // correction start distance
+//   correctToS,    // correction target distance
+//   correctStart,  // ms
+//   correcting,    // bool
+//   // metadata for popup:
+//   lastTruthLat,
+//   lastTruthLon,
+//   lastTruthTs
+// }
+const trains = new Map(); // key: `${route}_${rn}`
+
+// --- helpers ---
+function lerp(a,b,t){ return a + (b-a)*t; }
+
+// compute along-route position for animation
+function getAnimatedS(t, now){
+  const dtSec = (now - t.animStart) / 1000;
+  let s = t.animBaseS + t.velS * dtSec;
+
+  if (t.correcting){
+    const u = Math.min(1, (now - t.correctStart) / CORRECT_MS);
+    s = lerp(t.correctFromS, t.correctToS, u);
+    if (u >= 1) t.correcting = false;
+  }
+
+  const total = routeLengths[t.route] ?? 0;
+  s = Math.max(0, Math.min(s, total));
+  return s;
+}
+
+function makeIcon(color){
+  return L.divIcon({
+    className:'',
+    html:`<div class="train-dot" style="background:${color}"></div>`
+  });
+}
+
+function popupHtml(r, speedMps){
+  const kph = speedMps != null ? (speedMps*3.6).toFixed(0) : "-";
+  return `<b>${r.route.toUpperCase()} Line</b><br>
+  Train ${r.rn}<br>
+  Next: ${r.next_station ?? '-'}<br>
+  Heading: ${r.heading ?? '-'}°<br>
+  Speed: ${kph} km/h<br>
+  Arriving: ${r.arriving_now ? 'Yes':'No'}<br>
+  Delayed: ${r.delayed ? 'Yes':'No'}<br>
+  Time: ${r.ts_utc}`;
+}
+
+// --- route filter control (checkboxes) ---
+const RoutesControl = L.Control.extend({
+  onAdd: function(){
+    const div = L.DomUtil.create('div', 'leaflet-control routes');
+    div.innerHTML = `
+      <h4>Routes</h4>
+      ${ROUTES.map(([k,c,label]) => `
+        <label>
+          <input type="checkbox" data-route="${k}" checked />
+          <span class="swatch" style="background:${c}"></span> ${label}
+        </label>
+      `).join('')}
+    `;
+    L.DomEvent.disableClickPropagation(div);
+
+    div.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+      cb.addEventListener('change', (e) => {
+        const r = e.target.getAttribute('data-route');
+        const show = e.target.checked;
+        visible.set(r, show);
+        const grp = groups.get(r);
+        if (show) {
+          grp.addTo(map);
+        } else {
+          grp.removeFrom(map);
+        }
+      });
+    });
+
+    return div;
+  },
+  onRemove: function(){}
+});
+map.addControl(new RoutesControl({position:'topright'}));
+
+// --- load route polylines from cta_routes.json ---
+async function loadRoutes(){
+  const res = await fetch('cta_routes.json', { cache: 'no-store' });
+  const routesJson = await res.json();
+
+  for (const [route, segments] of Object.entries(routesJson)){
+    if (!segments || !segments.length) continue;
+
+    // 1) For Turf math: flatten into one LineString in [lon, lat] order
+    const coordsLonLatFlat = [];
+    for (const seg of segments){
+      for (const [lat, lon] of seg){      // JSON is [lat, lon]
+        coordsLonLatFlat.push([lon, lat]); // Turf wants [lon, lat]
+      }
+    }
+
+    const line = turf.lineString(coordsLonLatFlat);
+    routeLines[route]   = line;
+    routeLengths[route] = turf.length(line, { units: "kilometers" });
+
+    // 2) For map display: draw each segment separately (no flattening!)
+    const color = colorByRoute[route] || "#555";
+    segments.forEach(seg => {
+      // seg is already [ [lat, lon], ... ]
+      L.polyline(seg, {
+        color,
+        weight: 3,
+        opacity: 0.5
+      }).addTo(trackGroup);
+    });
+  }
+
+  routesReady = true;
+}
+
+
+// --- polling ---
+async function poll(){
+  if (!routesReady) return;
+
+  const res = await fetch('/latest', {cache:'no-store'});
+  const data = await res.json();
+  const seen = new Set();
+
+  const now = performance.now();
+  const tsPoll = Date.now();
+
+  for (const r of data){
+    if (r.lat == null || r.lon == null || !r.rn || !r.route) continue;
+
+    const route = r.route.toLowerCase();
+    if (!routeLines[route]) continue;
+
+    const id = `${route}_${r.rn}`;
+    seen.add(id);
+    const color = colorByRoute[route] || '#000';
+
+    // Snap truth to route line
+    const snapped = snapToRoute(route, Number(r.lat), Number(r.lon));
+    if (!snapped) continue;
+
+    const truthS = snapped.sKm;
+    const truthLat = snapped.lat;
+    const truthLon = snapped.lon;
+
+    const group = groups.get(route);
+
+    if (!trains.has(id)){
+      const marker = L.marker([truthLat, truthLon], {
+        icon: makeIcon(color)
+      }).bindPopup(popupHtml(r, 0));
+
+      marker.addTo(group);
+
+      trains.set(id, {
+        route,
+        rn: r.rn,
+        color,
+        marker,
+        lastTruthS: truthS,
+        prevTruthS: null,
+        velS: 0,
+        animBaseS: truthS,
+        animStart: now,
+        correctFromS: null,
+        correctToS: null,
+        correctStart: 0,
+        correcting: false,
+        lastTruthLat: truthLat,
+        lastTruthLon: truthLon,
+        lastTruthTs: r.ts_utc,
+        lastPollTs: tsPoll
+      });
+      continue;
+    }
+
+    const t = trains.get(id);
+    t.prevTruthS = t.lastTruthS;
+    t.lastTruthS = truthS;
+    t.lastTruthLat = truthLat;
+    t.lastTruthLon = truthLon;
+    t.lastTruthTs = r.ts_utc;
+
+    // Estimate along-track speed (km/s)
+    let velS = t.velS || 0;
+    let speedMps = Math.abs(velS * 1000);  // derive popup speed from current vel
+
+    if (t.prevTruthS != null){
+      const dt = Math.max(0.001, (tsPoll - t.lastPollTs) / 1000); // seconds
+      const deltaS = t.lastTruthS - t.prevTruthS;                 // km
+
+      // If movement is tiny (< 10 m), keep previous velocity
+      const EPS_KM = 0.01; // 10 meters
+      if (Math.abs(deltaS) > EPS_KM) {
+        const vKmPerSec = deltaS / dt;
+        const vMpsRaw = vKmPerSec * 1000;
+
+        // cap to reasonable speed
+        const maxMps = 35; // ~126 km/h
+        const cappedMps = Math.max(-maxMps, Math.min(maxMps, vMpsRaw));
+
+        velS = (cappedMps / 1000) * 0.25;      // km/s CHANGE SPEED HERE
+        speedMps = Math.abs(cappedMps);
+      }
+    }
+
+    t.velS = velS;
+    t.lastPollTs = tsPoll;
+
+
+    // Correction in S space
+    const curS = getAnimatedS(t, now);
+    const errMeters = Math.abs(curS - truthS) * 1000;
+
+    if (errMeters > MAX_DRIFT_METERS){
+      // Big error → snap
+      t.animBaseS = truthS;
+      t.animStart = now;
+      t.correcting = false;
+      const pos = routeToLatLon(route, truthS);
+      if (pos) {
+        t.marker.setLatLng([pos.lat, pos.lon]);
+      }
+    } else {
+      // Ease from current animated S to new truth S
+      t.correctFromS = curS;
+      t.correctToS = truthS;
+      t.correctStart = now;
+      t.correcting = true;
+      t.animBaseS = curS;
+      t.animStart = now;
+    }
+
+    t.marker.setPopupContent(popupHtml(r, speedMps));
+
+    if (!visible.get(route)){
+      groups.get(route).removeFrom(map);
+    }
+  }
+
+  // Remove trains that disappeared
+  for (const [id, t] of Array.from(trains.entries())){
+    if (!seen.has(id)){
+      groups.get(t.route).removeLayer(t.marker);
+      trains.delete(id);
+    }
+  }
+}
+
+// --- animation loop ---
+function tick(){
+  const now = performance.now();
+  for (const [, t] of trains){
+    const s = getAnimatedS(t, now);
+    const pos = routeToLatLon(t.route, s);
+    if (pos){
+      t.marker.setLatLng([pos.lat, pos.lon]);
+    }
+  }
+  requestAnimationFrame(tick);
+}
+
+// --- start up ---
+// 1) load route polylines
+// 2) start polling + animation once routes are ready
+loadRoutes().then(() => {
+  poll();
+  setInterval(poll, POLL_MS);
+  requestAnimationFrame(tick);
+});
+</script>
+</body>
+</html>
