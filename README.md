@@ -1,5 +1,5 @@
 # MLDS-CTA-Project
-Real-time animated map of every CTA train in Chicago, powered by the CTA Train Tracker API, FastAPI, SQLite, Leaflet.js, and Docker.
+Real-time animated map of every CTA train in Chicago, powered by the CTA Train Tracker API, FastAPI, SQLite, Leaflet.js, and Docker. Created for MLDS-400 final project.
 
 This project continuously polls the CTA API, stores train positions in a SQLite database, and serves a live-updating, smoothly animated map showing each train moving along its route.
 
