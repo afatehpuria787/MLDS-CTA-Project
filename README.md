@@ -62,23 +62,22 @@ Get one here:
 https://www.transitchicago.com/developers/traintracker/
 ```
 # Clone the Repo
-![Clone Demo](assets/clone.gif)
+
 Run this where you want this project to be stored on your local machine:
 ```
 git clone https://github.com/Ben-Maisel/MLDS-CTA-Project.git
 ```
 
 # Build the Docker image
-![Build Demo](assets/build.gif)
+
 **Make Sure Docker is Running on Your Machine**
 Run this in the project root folder (same directory as your Dockerfile):
 ```
 docker build -t cta-tracker .
 ```
-you must be in the right directory for this to work. If you are confused where you should be running this command, refer to the GIF
 
 # Run the container
-![Run Demo](assets/run.gif)
+
 Run this command right after buiding the image in the same location:
 ```
 docker run -e CTA_TRAIN_API_KEY="YOUR_API_KEY" -e CTA_DB_PATH="/app/cta_trains.db" -p 8000:8000 cta-tracker
