@@ -1,11 +1,9 @@
 # MLDS-CTA-Project
 Real-time animated map of every CTA train in Chicago, powered by the CTA Train Tracker API, FastAPI, SQLite, Leaflet.js, and Docker. Created for MLDS-400 final project.
 
-This project continuously polls the CTA API, stores train positions in a SQLite database, and serves a live-updating, smoothly animated map showing each train moving along its route.
+This project continuously polls the CTA API, stores train positions in a SQLite database, and serves a live-updating, smoothly animated map showing each train moving along its route. It includes:
 
-# Features
-
-- Live polling of all CTA rail lines (Red, Blue, Brn, G, Org, P, Pink, Y)
+- Live polling of all CTA rail lines
 - Smooth client-side interpolated animation between API updates
 - SQLite database storing historical train positions
 - FastAPI backend serving live data
@@ -13,8 +11,10 @@ This project continuously polls the CTA API, stores train positions in a SQLite 
 - Dockerized for universal, repeatable deployment
 - Fully automatic background train data extraction
 
+---
+
 # Project Structure
-```
+```graphql
 MLDS-CTA-Project/
 ├── assets/ # Gifs used in the README are stored here
 │
@@ -35,65 +35,39 @@ MLDS-CTA-Project/
 ├── cta_routes.json            # Json with Info of Track Coordiantes
 ├── CODEOWNERS                 # Collaboration rules
 └── README.md                  # You're reading this
-```
 
+```
+---
 # Requirements
 
-### Git
-```
-Windows: https://git-scm.com/download/win
+To run this project, you must have Git and Docker Desktop installed on your machine. Additionally, you will need a CTA Train Tracker API key which you can get here: https://www.transitchicago.com/developers/traintracker/.
 
-macOS: https://git-scm.com/download/mac
-
-Linux: https://git-scm.com/download/linux
-```
-
-### Docker Desktop
-```
-Windows: https://docs.docker.com/desktop/install/windows-install/
-
-macOS: https://docs.docker.com/desktop/install/mac-install/
-
-Linux: https://docs.docker.com/engine/install/
-```
-### A CTA Train Tracker API key
-Get one here:
-```
-https://www.transitchicago.com/developers/traintracker/
-```
+---
 # Clone the Repo
 
 Run this where you want this project to be stored on your local machine:
 ```
-git clone https://github.com/Ben-Maisel/MLDS-CTA-Project.git
+git clone https://github.com/afatehpuria787/MLDS-CTA-Project.git
 ```
 
 # Build the Docker image
 
-**Make Sure Docker is Running on Your Machine**
-Run this in the project root folder (same directory as your Dockerfile):
+**Make sure Docker is running on your machine.** Run this in the project root folder (same directory as your Dockerfile):
 ```
 docker build -t cta-tracker .
 ```
 
 # Run the container
 
-Run this command right after buiding the image in the same location:
+Insert your API key in the command below and run it right after buiding the image in the same location:
 ```
 docker run -e CTA_TRAIN_API_KEY="YOUR_API_KEY" -e CTA_DB_PATH="/app/cta_trains.db" -p 8000:8000 cta-tracker
 ```
-Use your API KEY
 
 This starts:
 
 1. extract_data.py in the background
 2. server_fastapi.py serving the API + map
-
-You should see log output like:
-```
-Starting extract_data.py (CTA data logger)…
-Starting FastAPI server on 0.0.0.0:8000…
-```
 
 # View the live CTA map
 ![View Demo](assets/browser.gif)
@@ -101,17 +75,8 @@ In your browser, go to:
 ```
 http://localhost:8000
 ```
-(or just click the link in this README)
 
-You’ll see:
-
-Chicago map
-
-Every train as a colored dot
-
-Smooth motion between updates
-
-Popups showing speed, heading, next station, delayed status, etc.
+Hover over Chicago's map to see every train as a colored dot, with popups showing speed, heading, next station, delayed status, etc. The map is animated and with update automatically every 30 seconds to show the train's latest location!
 
 # Stopping the container
 ![Stop Demo](assets/stopping.gif)
